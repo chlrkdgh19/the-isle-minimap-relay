@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: the-isle-minimap-relay
+    runtime: python
+    plan: free
+    buildCommand: python -m compileall cloud_relay_server.py
+    startCommand: python cloud_relay_server.py
+    healthCheckPath: /health
+    autoDeploy: true
