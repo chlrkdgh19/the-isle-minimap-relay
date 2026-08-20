@@ -104,7 +104,7 @@ def auth(payload):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "TheIsleRelayCloud/1.1"
+    server_version = "TheIsleRelayCloud/1.2"
 
     def log_message(self, fmt, *args):
         client_ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()
@@ -147,6 +147,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {
                 "ok": True,
                 "service": "The Isle MiniMap Relay",
+                "version": "1.2",
                 "rooms": room_count,
                 "members": member_count,
                 "time": now(),
@@ -172,6 +173,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.update_position(payload)
             elif path == "/api/state":
                 self.get_state(payload)
+            elif path == "/api/clear_paths":
+                self.clear_paths(payload)
+            elif path == "/api/destination":
+                self.update_destination(payload)
             elif path == "/api/leave":
                 self.leave_room(payload)
             else:
@@ -193,6 +198,10 @@ class Handler(BaseHTTPRequestHandler):
                 "created_at": now(),
                 "last_activity": now(),
                 "members": {member["member_id"]: member},
+                # 방 전체 공유 목적지. None이면 목적지 없음.
+                "destination": None,
+                "destination_revision": 0,
+                "path_revision": 0,
             }
         self._send(200, {
             "ok": True,
@@ -277,11 +286,106 @@ class Handler(BaseHTTPRequestHandler):
             return
         with lock:
             members = [public_member(m) for m in room["members"].values()]
+            destination = room.get("destination")
+            destination_revision = int(room.get("destination_revision", 0))
+            path_revision = int(room.get("path_revision", 0))
         self._send(200, {
             "ok": True,
             "room_code": clean_room_code(payload.get("room_code")),
             "server_time": now(),
             "members": members,
+            "destination": destination,
+            "destination_revision": destination_revision,
+            "path_revision": path_revision,
+        })
+
+    def clear_paths(self, payload):
+        """모든 멤버의 이동 경로만 지운다. 현재 lat/long 좌표는 유지한다."""
+        room, member, error = auth(payload)
+        if error:
+            self._send(401 if room else 404, {"error": error})
+            return
+
+        t = now()
+        with lock:
+            cleared = 0
+            for m in room["members"].values():
+                if m.get("lat") is not None and m.get("long") is not None:
+                    m["path"] = [{
+                        "lat": float(m["lat"]),
+                        "long": float(m["long"]),
+                        "t": float(m.get("updated_at") or t),
+                    }]
+                else:
+                    m["path"] = []
+                cleared += 1
+            room["path_revision"] = int(room.get("path_revision", 0)) + 1
+            path_revision = room["path_revision"]
+            room["last_activity"] = t
+
+        self._send(200, {
+            "ok": True,
+            "cleared_members": cleared,
+            "path_revision": path_revision,
+            "server_time": t,
+        })
+
+    def update_destination(self, payload):
+        """방 전체 목적지를 설정/삭제한다. 마지막 요청이 방의 공유 목적지가 된다."""
+        room, member, error = auth(payload)
+        if error:
+            self._send(401 if room else 404, {"error": error})
+            return
+
+        action = clean_text(payload.get("action"), 12).lower()
+        t = now()
+
+        if action == "clear":
+            with lock:
+                room["destination"] = None
+                room["destination_revision"] = int(room.get("destination_revision", 0)) + 1
+                revision = room["destination_revision"]
+                room["last_activity"] = t
+            self._send(200, {
+                "ok": True,
+                "destination": None,
+                "destination_revision": revision,
+                "server_time": t,
+            })
+            return
+
+        if action != "set":
+            self._send(400, {"error": "action은 set 또는 clear가 필요합니다."})
+            return
+
+        try:
+            lat = float(payload.get("lat"))
+            long = float(payload.get("long"))
+        except (TypeError, ValueError):
+            self._send(400, {"error": "목적지 lat/long 값이 필요합니다."})
+            return
+        if not (-2000 <= lat <= 2000 and -2000 <= long <= 2000):
+            self._send(400, {"error": "목적지 좌표 범위를 벗어났습니다."})
+            return
+
+        with lock:
+            room["destination_revision"] = int(room.get("destination_revision", 0)) + 1
+            revision = room["destination_revision"]
+            room["destination"] = {
+                "lat": lat,
+                "long": long,
+                "set_by_member_id": member["member_id"],
+                "set_by_nickname": member["nickname"],
+                "updated_at": t,
+            }
+            destination = room["destination"]
+            room["last_activity"] = t
+
+        self._send(200, {
+            "ok": True,
+            "destination": destination,
+            "destination_revision": revision,
+            "server_time": t,
         })
 
     def leave_room(self, payload):
