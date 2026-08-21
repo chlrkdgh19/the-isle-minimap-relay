@@ -38,6 +38,13 @@ def clean_room_code(value):
     return re.sub(r"[^A-Za-z0-9]", "", str(value or "")).upper()[:12]
 
 
+def clean_color(value, fallback="#00EBFF"):
+    text = str(value or "").strip().upper()
+    if re.fullmatch(r"#[0-9A-F]{6}", text):
+        return text
+    return str(fallback).upper()
+
+
 def new_room_code():
     with lock:
         for _ in range(100):
@@ -47,12 +54,13 @@ def new_room_code():
     raise RuntimeError("방 코드를 생성하지 못했습니다.")
 
 
-def make_member(nickname):
+def make_member(nickname, color="#00EBFF"):
     t = now()
     return {
         "member_id": uuid.uuid4().hex[:16],
         "token": secrets.token_urlsafe(24),
         "nickname": nickname,
+        "color": clean_color(color),
         "lat": None,
         "long": None,
         "updated_at": None,
@@ -66,6 +74,7 @@ def public_member(m):
     return {
         "member_id": m["member_id"],
         "nickname": m["nickname"],
+        "color": clean_color(m.get("color")),
         "lat": m["lat"],
         "long": m["long"],
         "updated_at": m["updated_at"],
@@ -131,7 +140,7 @@ def auth(payload):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "TheIsleRelayCloud/1.3"
+    server_version = "TheIsleRelayCloud/1.4"
 
     def log_message(self, fmt, *args):
         client_ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()
@@ -174,7 +183,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {
                 "ok": True,
                 "service": "The Isle MiniMap Relay",
-                "version": "1.3",
+                "version": "1.4",
                 "rooms": room_count,
                 "members": member_count,
                 "time": now(),
@@ -198,6 +207,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.join_room(payload)
             elif path == "/api/update":
                 self.update_position(payload)
+            elif path == "/api/color":
+                self.update_color(payload)
             elif path == "/api/state":
                 self.get_state(payload)
             elif path == "/api/clear_paths":
@@ -218,12 +229,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def create_room(self, payload):
         nickname = clean_text(payload.get("nickname"), MAX_NICKNAME_LEN)
+        color = clean_color(payload.get("color"))
         if not nickname:
             self._send(400, {"error": "닉네임을 입력해 주세요."})
             return
 
         code = new_room_code()
-        member = make_member(nickname)
+        member = make_member(nickname, color)
         with lock:
             rooms[code] = {
                 "created_at": now(),
@@ -250,6 +262,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def join_room(self, payload):
         nickname = clean_text(payload.get("nickname"), MAX_NICKNAME_LEN)
+        color = clean_color(payload.get("color"))
         code = clean_room_code(payload.get("room_code"))
         if not nickname or not code:
             self._send(400, {"error": "닉네임과 방 코드가 필요합니다."})
@@ -271,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(409, {"error": f"방 인원은 최대 {MAX_ROOM_MEMBERS}명입니다."})
                 return
 
-            member = make_member(nickname)
+            member = make_member(nickname, color)
             room["members"][member["member_id"]] = member
             if replaced_owner:
                 room["owner_member_id"] = member["member_id"]
@@ -305,6 +318,8 @@ class Handler(BaseHTTPRequestHandler):
 
         t = now()
         with lock:
+            if payload.get("color") is not None:
+                member["color"] = clean_color(payload.get("color"), member.get("color") or "#00EBFF")
             member["lat"] = lat
             member["long"] = long
             member["updated_at"] = t
@@ -323,6 +338,20 @@ class Handler(BaseHTTPRequestHandler):
             room["last_activity"] = t
 
         self._send(200, {"ok": True, "updated_at": t})
+
+    def update_color(self, payload):
+        """사용자가 고른 파티 마커 색상을 저장하고 모든 멤버 state에 공유한다."""
+        room, member, error = auth(payload)
+        if error:
+            self._send(401 if room else 404, {"error": error})
+            return
+        color = clean_color(payload.get("color"), member.get("color") or "#00EBFF")
+        t = now()
+        with lock:
+            member["color"] = color
+            member["last_seen"] = t
+            room["last_activity"] = t
+        self._send(200, {"ok": True, "color": color, "server_time": t})
 
     def get_state(self, payload):
         room, member, error = auth(payload)
