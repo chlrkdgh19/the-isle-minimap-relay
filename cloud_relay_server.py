@@ -18,8 +18,6 @@ MAX_PATH_POINTS = 120
 PATH_MIN_DISTANCE = 0.10
 MEMBER_EXPIRE_SEC = 60 * 60
 ROOM_EXPIRE_SEC = 6 * 60 * 60
-DANGER_PING_TTL_SEC = 45.0
-MAX_DANGER_PINGS = 8
 
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 rooms = {}
@@ -82,15 +80,6 @@ def public_member(m):
     }
 
 
-def _prune_danger_pings(room, t=None):
-    t = now() if t is None else float(t)
-    active = [p for p in room.get("danger_pings", []) if float(p.get("expires_at", 0) or 0) > t]
-    if len(active) != len(room.get("danger_pings", [])):
-        room["danger_pings"] = active
-        room["danger_ping_revision"] = int(room.get("danger_ping_revision", 0)) + 1
-    return active
-
-
 def _ensure_owner(room):
     owner_id = str(room.get("owner_member_id") or "")
     if owner_id and owner_id in room.get("members", {}):
@@ -109,7 +98,6 @@ def cleanup():
     with lock:
         dead_rooms = []
         for code, room in rooms.items():
-            _prune_danger_pings(room, t)
             dead_members = [
                 mid for mid, m in room["members"].items()
                 if t - m.get("last_seen", 0) > MEMBER_EXPIRE_SEC
@@ -140,7 +128,7 @@ def auth(payload):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "TheIsleRelayCloud/1.4"
+    server_version = "TheIsleRelayCloud/1.5"
 
     def log_message(self, fmt, *args):
         client_ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()
@@ -183,7 +171,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {
                 "ok": True,
                 "service": "The Isle MiniMap Relay",
-                "version": "1.4",
+                "version": "1.5",
                 "rooms": room_count,
                 "members": member_count,
                 "time": now(),
@@ -217,8 +205,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.update_destination(payload)
             elif path == "/api/destination_lock":
                 self.update_destination_lock(payload)
-            elif path == "/api/danger_ping":
-                self.update_danger_ping(payload)
             elif path == "/api/leave":
                 self.leave_room(payload)
             else:
@@ -248,8 +234,6 @@ class Handler(BaseHTTPRequestHandler):
                 "destination_locked": False,
                 "destination_lock_revision": 0,
                 "path_revision": 0,
-                "danger_pings": [],
-                "danger_ping_revision": 0,
             }
         self._send(200, {
             "ok": True,
@@ -367,8 +351,6 @@ class Handler(BaseHTTPRequestHandler):
             owner_member_id = _ensure_owner(room)
             destination_locked = bool(room.get("destination_locked", False))
             destination_lock_revision = int(room.get("destination_lock_revision", 0))
-            danger_pings = list(_prune_danger_pings(room, t))
-            danger_ping_revision = int(room.get("danger_ping_revision", 0))
         self._send(200, {
             "ok": True,
             "room_code": clean_room_code(payload.get("room_code")),
@@ -380,8 +362,6 @@ class Handler(BaseHTTPRequestHandler):
             "destination_lock_revision": destination_lock_revision,
             "owner_member_id": owner_member_id,
             "path_revision": path_revision,
-            "danger_pings": danger_pings,
-            "danger_ping_revision": danger_ping_revision,
         })
 
     def clear_paths(self, payload):
@@ -503,59 +483,6 @@ class Handler(BaseHTTPRequestHandler):
             "destination_locked": locked,
             "destination_lock_revision": revision,
             "owner_member_id": owner_member_id,
-            "server_time": t,
-        })
-
-    def update_danger_ping(self, payload):
-        """공유 위험 핑 추가/전체 삭제. 핑은 서버 시간 기준 45초 뒤 자동 만료된다."""
-        room, member, error = auth(payload)
-        if error:
-            self._send(401 if room else 404, {"error": error})
-            return
-
-        action = clean_text(payload.get("action"), 16).lower()
-        t = now()
-        with lock:
-            _prune_danger_pings(room, t)
-
-            if action == "clear_all":
-                room["danger_pings"] = []
-                room["danger_ping_revision"] = int(room.get("danger_ping_revision", 0)) + 1
-            elif action == "add":
-                try:
-                    lat = float(payload.get("lat"))
-                    long = float(payload.get("long"))
-                except (TypeError, ValueError):
-                    self._send(400, {"error": "위험 핑 lat/long 값이 필요합니다."})
-                    return
-                if not (-2000 <= lat <= 2000 and -2000 <= long <= 2000):
-                    self._send(400, {"error": "위험 핑 좌표 범위를 벗어났습니다."})
-                    return
-                ping = {
-                    "ping_id": uuid.uuid4().hex[:12],
-                    "lat": lat,
-                    "long": long,
-                    "set_by_member_id": member["member_id"],
-                    "set_by_nickname": member["nickname"],
-                    "created_at": t,
-                    "expires_at": t + DANGER_PING_TTL_SEC,
-                }
-                room["danger_pings"].append(ping)
-                if len(room["danger_pings"]) > MAX_DANGER_PINGS:
-                    room["danger_pings"] = room["danger_pings"][-MAX_DANGER_PINGS:]
-                room["danger_ping_revision"] = int(room.get("danger_ping_revision", 0)) + 1
-            else:
-                self._send(400, {"error": "action은 add 또는 clear_all이 필요합니다."})
-                return
-
-            room["last_activity"] = t
-            pings = list(room.get("danger_pings", []))
-            revision = int(room.get("danger_ping_revision", 0))
-
-        self._send(200, {
-            "ok": True,
-            "danger_pings": pings,
-            "danger_ping_revision": revision,
             "server_time": t,
         })
 
